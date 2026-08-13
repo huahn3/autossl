@@ -1,0 +1,9 @@
+version: 4.7.0
+files:
+  - url: KeyManager-Setup-4.7.0.exe
+    sha512: m7Tk5QTvvrp5KxfLejk3tqojYkLu/gwjcRjX0aeoRHF/fLHLVK4S/3VYFYLbvh5GEAtDBbp+e3+NQqvJVTXzcw==
+    size: 82387152
+path: KeyManager-Setup-4.7.0.exe
+sha512: m7Tk5QTvvrp5KxfLejk3tqojYkLu/gwjcRjX0aeoRHF/fLHLVK4S/3VYFYLbvh5GEAtDBbp+e3+NQqvJVTXzcw==
+releaseNotes: 新增;1. 支持国密证书全生命周期管理;2. 支持国密证书加密私钥的解密;3. 支持创建基于PQC ML-DSA算法的CSR;4. 支持导出系统日志文件;5. 支持在统信UOS系统中拉起KeyManager;优化;1. 优化界面交互，提升用户体验;2. 优化证书导出及格式转换问题;3. 修复中文域名生成CSR的问题;4. 修复并优化其它多项已知问题
+releaseDate: '2026-03-30T10:06:39.347Z'
