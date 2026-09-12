@@ -33,19 +33,30 @@ CAP_DIR     = os.path.join(BASE_DIR, "captcha")
 UA          = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 MAX_ROUNDS  = 3
+DEFAULT_GEMINI_PROXY = "http://Clash:pfabkvBh@192.168.31.99:7890"
 
 PROMPT = """\
-这是腾讯图标点选验证码，共两张图：
-图1（指令条）：从左到右排列 2-4 个目标字符或图标，代表点击顺序。
-图2（挑战图，坐标系 672x480）：AI 生成背景上散布多个带圆形边框的图标标记，含干扰项。
+输入包含两张图片：
+- 图1（顶部指令条）：展示了从左到右需要依次点击的目标图标或字符图案。
+- 图2（主图画布，坐标尺寸 672x480）：大背景图，其中散布着若干带有圆形/线框标记的图标对象。
 
-请完成以下任务：
-① 读出图1字符/图标序列原文（targets）
-② 在图2找到匹配标记，按图1顺序记录各标记圆心坐标
-③ 仅输出 JSON，不加任何其他文字：
-{"targets":"图1原文","clicks":[{"x":整数,"y":整数},…]}
+任务目标：
+请在图2中按图1从左至右的顺序，依次找出对应的目标，并定位其圆心像素坐标(x, y)。
 
-约束：clicks 数量 == targets 字符数；x∈[0,672]，y∈[0,480]；坐标精确到圆心像素。"""
+输出格式要求：
+仅输出标准 JSON 格式，不要附带任何分析或解释文字：
+{
+  "targets": "目标简述",
+  "clicks": [
+    {"x": 120, "y": 80},
+    {"x": 350, "y": 210}
+  ]
+}
+
+约束规则：
+1. x 坐标范围 [10, 660]，y 坐标范围 [10, 470]，必须是整数坐标；
+2. clicks 列表中的点位顺序必须严格对应图1从左到右的排列顺序；
+3. clicks 元素个数必须与图1中的目标数量一致。"""
 
 
 # ── 配置读写 ───────────────────────────────────────────────────────────────────
@@ -133,43 +144,101 @@ def gemini_solve(cfg: dict, bg_path: str, strip_path: str, timeout: int = 55):
     """
     keys  = cfg.get("gemini_api_keys") or (
             [cfg["gemini_api_key"]] if cfg.get("gemini_api_key") else [])
-    model = cfg.get("gemini_model", "gemini-2.0-flash")
+    model = cfg.get("gemini_model", "gemini-3.5-flash")
     if not keys:
         return None, None
+
+    model_list = [model]
+    if isinstance(cfg.get("gemini_models_vote"), list):
+        for m in cfg["gemini_models_vote"]:
+            if m and m not in model_list:
+                model_list.append(m)
 
     big_strip = scale_png(strip_path, factor=3)   # 放大指令条
     body = json.dumps({
         "contents": [{"parts": [
             {"text": PROMPT},
-            {"inline_data": {"mime_type": "image/png", "data": encode_img(big_strip)}},
-            {"inline_data": {"mime_type": "image/png", "data": encode_img(bg_path)}},
+            {"inlineData": {"mimeType": "image/png", "data": encode_img(big_strip)}},
+            {"inlineData": {"mimeType": "image/png", "data": encode_img(bg_path)}},
         ]}],
-        "generationConfig": {"response_mime_type": "application/json", "temperature": 0},
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }).encode()
 
+    # 获取 Gemini 专用代理 (优先级: cfg['gemini_proxy'] > DEFAULT_GEMINI_PROXY > cfg['proxy'])
+    proxy_conf = cfg.get("gemini_proxy")
+    if proxy_conf is not None:
+        proxy_url = None if (proxy_conf in ("", "direct", False)) else proxy_conf
+    else:
+        proxy_url = DEFAULT_GEMINI_PROXY or cfg.get("proxy")
+
+    handlers = [urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})] if proxy_url else []
+    opener = urllib.request.build_opener(*handlers)
+    if proxy_url:
+        masked = re.sub(r':([^:@]+)@', ':****@', proxy_url)
+        print(f"   [Gemini] 网络代理: {masked}")
+
     for ki, key in enumerate(keys, 1):
-        url = (f"https://generativelanguage.googleapis.com/v1beta/"
-               f"models/{model}:generateContent")
-        req = urllib.request.Request(
-            url, data=body,
-            headers={"Content-Type": "application/json", "x-goog-api-key": key},
-            method="POST",
-        )
         for attempt in range(1, 3):
+            cur_model = model_list[(attempt - 1) % len(model_list)]
+            url = (f"https://generativelanguage.googleapis.com/v1beta/"
+                   f"models/{cur_model}:generateContent")
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": "application/json", "x-goog-api-key": key},
+                method="POST",
+            )
             try:
-                print(f"   [Gemini] key{ki}/{len(keys)} {model} 第{attempt}次...")
-                proxy_url = cfg.get("proxy")
-                handlers = [urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})] if proxy_url else []
-                opener = urllib.request.build_opener(*handlers)
+                print(f"   [Gemini] key{ki}/{len(keys)} {cur_model} 第{attempt}次...")
                 with opener.open(req, timeout=timeout) as r:
                     resp    = json.loads(r.read().decode())
                 text        = resp["candidates"][0]["content"]["parts"][0]["text"]
                 data        = parse_json(text)
-                targets     = str(data.get("targets", "")).strip()
-                clicks      = [(int(c["x"]), int(c["y"])) for c in data.get("clicks", [])]
+                
+                # 容错提取 targets
+                raw_targets = data.get("targets") or data.get("target") or data.get("items") or data.get("sequence") or ""
+                if isinstance(raw_targets, list):
+                    targets = "".join(str(x) for x in raw_targets)
+                else:
+                    targets = str(raw_targets).strip()
+
+                # 容错提取 clicks (支持 dict 或 list, 兼容字段变体)
+                raw_clicks = data.get("clicks") or data.get("click") or data.get("coordinates") or data.get("points") or data.get("markers") or []
+                clicks = []
+                for c in raw_clicks:
+                    try:
+                        if isinstance(c, (list, tuple)) and len(c) >= 2:
+                            clicks.append((int(c[0]), int(c[1])))
+                        elif isinstance(c, dict):
+                            x = c.get("x") if "x" in c else c.get("X")
+                            y = c.get("y") if "y" in c else c.get("Y")
+                            if x is not None and y is not None:
+                                clicks.append((int(x), int(y)))
+                    except (ValueError, TypeError):
+                        continue
+
                 print(f"   [Gemini] targets={targets!r}  clicks={clicks}")
-                if targets and clicks:
+                if clicks:
+                    if not targets:
+                        targets = f"auto_{len(clicks)}"
                     return targets, clicks
+                else:
+                    raw_preview = text.strip().replace("\n", " ")[:150]
+                    print(f"   [Gemini] ⚠️ 坐标未解析成功, 模型原始输出: {raw_preview}")
+
+            except urllib.error.HTTPError as e:
+                err_detail = ""
+                try:
+                    raw = e.read().decode("utf-8", errors="replace")
+                    err_json = json.loads(raw)
+                    err_detail = err_json.get("error", {}).get("message") or raw[:200]
+                except Exception:
+                    pass
+                msg = f"HTTP {e.code}: {err_detail}" if err_detail else str(e)
+                print(f"   [Gemini] key{ki} 第{attempt}次失败: {msg}")
+                if e.code == 429 or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    break           # 该 key 限流，换下一个
+                if attempt == 1:
+                    time.sleep(3)   # 短暂等待后重试
             except Exception as e:
                 msg = str(e)[:120]
                 print(f"   [Gemini] key{ki} 第{attempt}次失败: {msg}")
@@ -362,6 +431,8 @@ def solve_login(cfg: dict = None, max_rounds: int = MAX_ROUNDS, headless: bool =
     返回 True=登录成功(已写回config), False=失败
     """
     cfg      = cfg or load_cfg()
+    if "gemini_proxy" not in cfg and DEFAULT_GEMINI_PROXY:
+        cfg["gemini_proxy"] = DEFAULT_GEMINI_PROXY
     if headless is None:
         # 青龙/Linux 无显示器默认 headless; macOS 弹有头窗口便于人工兜底
         headless = (sys.platform != "darwin") and not os.environ.get("DISPLAY")
@@ -432,8 +503,13 @@ def main():
                     help="无头模式(青龙/无显示器环境)")
     ap.add_argument("--rounds", type=int, default=MAX_ROUNDS,
                     help="重试轮数(默认3)")
+    ap.add_argument("--gemini-proxy", default=None,
+                    help="Gemini 专用代理地址 (默认: %s)" % DEFAULT_GEMINI_PROXY)
     args = ap.parse_args()
-    ok = solve_login(max_rounds=args.rounds, headless=args.headless or None)
+    cfg = load_cfg()
+    if args.gemini_proxy:
+        cfg["gemini_proxy"] = args.gemini_proxy
+    ok = solve_login(cfg=cfg, max_rounds=args.rounds, headless=args.headless or None)
     sys.exit(0 if ok else 1)
 
 

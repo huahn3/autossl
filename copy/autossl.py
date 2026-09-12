@@ -58,7 +58,6 @@ def log(msg):
 
 
 _GLOBAL_PROXY = None
-DEFAULT_GEMINI_PROXY = "http://Clash:pfabkvBh@192.168.31.99:7890"
 
 def set_global_proxy(proxy_url):
     global _GLOBAL_PROXY
@@ -68,8 +67,6 @@ def set_global_proxy(proxy_url):
         os.environ["HTTPS_PROXY"] = proxy_url
         os.environ["http_proxy"] = proxy_url
         os.environ["https_proxy"] = proxy_url
-        os.environ["NO_PROXY"] = "127.0.0.1,localhost,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
-        os.environ["no_proxy"] = "127.0.0.1,localhost,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
 
 def http(url, method="GET", data=None, cookies="", extra_headers=None, form=False, proxy=None):
     proxy = proxy or _GLOBAL_PROXY
@@ -92,10 +89,7 @@ def http(url, method="GET", data=None, cookies="", extra_headers=None, form=Fals
             headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     handlers = []
-    is_internal = any(x in url for x in ['192.168.', '127.0.0.1', 'localhost', '10.', '172.16.'])
-    if is_internal:
-        handlers.append(urllib.request.ProxyHandler({}))  # 显式空字典, 强制禁止读取系统环境变量代理
-    elif proxy:
+    if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     opener = urllib.request.build_opener(*handlers)
     with opener.open(req, timeout=60) as resp:
@@ -257,59 +251,6 @@ def passnat_add_txt(cfg, domain_id, rec, parent):
 
 
 # ---------------------------------------------------------------------------
-
-def sync_to_lucky(cfg, domain, force_update=False):
-    lucky_cfg = cfg.get("lucky")
-    if not lucky_cfg:
-        return
-    url = lucky_cfg.get("api_url")
-    token = lucky_cfg.get("open_token")
-    base_dir = lucky_cfg.get("base_cert_dir", "")
-    if not url or not token:
-        return
-    cert_path = os.path.join(base_dir, domain, "fullchain.pem")
-    key_path = os.path.join(base_dir, domain, "domain.key")
-
-    # 查找是否已存在同名条目
-    existing_key = ""
-    try:
-        status, text = http(url, method="GET", extra_headers={"OpenToken": token})
-        res_obj = parse_json(text, "查询Lucky证书列表")
-        items = res_obj.get("list", [])
-        for item in items:
-            if item.get("Remark") == domain or (item.get("CertsInfo") and domain in item.get("CertsInfo", {}).get("Domains", [])):
-                existing_key = item.get("Key", "")
-                break
-    except Exception as e:
-        log("  !! 查询 Lucky 规则失败: %s" % e)
-        return
-
-    if existing_key and not force_update:
-        log("  Lucky 面板已存在 [%s] 证书规则，无需重复添加" % domain)
-        return
-
-    if existing_key:
-        log("==> 同步证书到 Lucky 面板 (%s): 发现已有规则(Key=%s), 进行覆盖更新" % (domain, existing_key))
-    else:
-        log("==> 自动补齐到 Lucky 面板 (%s): 发现 Lucky 缺失此域名，自动新增规则" % domain)
-
-    payload = {
-        "Key": existing_key,
-        "Remark": domain,
-        "Enable": True,
-        "AddFrom": "path",
-        "ExtParams": {
-            "certPath": cert_path,
-            "keyPath": key_path
-        }
-    }
-    try:
-        status, text = http(url, method="POST", data=payload, extra_headers={"OpenToken": token})
-        log("  Lucky 响应: %s" % text)
-    except Exception as e:
-        log("  !! Lucky 同步错误: %s" % e)
-
-
 # Step 6: 触发验证 + 轮询 + 下载证书
 # ---------------------------------------------------------------------------
 def freessl_verify(cfg, order_id):
@@ -439,13 +380,9 @@ def ensure_credentials(cfg, auto_login=True):
     log("==> freessl 登录凭证失效, 自动调用验证码登录刷新 cookie ...")
     try:
         import captcha_solver
-        if "gemini_proxy" not in cfg:
-            cfg["gemini_proxy"] = DEFAULT_GEMINI_PROXY
         ok = captcha_solver.solve_login(cfg=cfg)
         if ok:
             cfg = json.load(open(CONFIG_FILE, encoding="utf-8"))
-            if "gemini_proxy" not in cfg:
-                cfg["gemini_proxy"] = DEFAULT_GEMINI_PROXY
             log("==> 自动登录成功, 重新检查凭证")
             return check_credentials(cfg), cfg
         log("==> 自动登录失败(验证码多次未通过)")
@@ -464,7 +401,6 @@ def process_domain(cfg, domain, renew, days, always):
             log("%s: 未找到现有证书, 首次申请" % domain)
         elif left > days:
             log("%s: 证书还有 %d 天到期 (>%d), 无需续期" % (domain, left, days))
-            sync_to_lucky(cfg, domain, force_update=False)
             return True
         else:
             log("%s: 证书还剩 %d 天到期 (<=%d), 开始续期" % (domain, left, days))
@@ -497,7 +433,6 @@ def process_domain(cfg, domain, renew, days, always):
 
     info = freessl_wait_issued(cfg, order_id)
     freessl_download_cert(cfg, order_id, out_dir)
-    sync_to_lucky(cfg, domain, force_update=True)
 
     with open(os.path.join(out_dir, "info.json"), "w") as f:
         json.dump({"domain": domain, "order_id": order_id, "status": info.get("status"),
@@ -520,8 +455,6 @@ def main():
                     help="跳过到期检查, 总是重新申请 (重发证书/调试用)")
     ap.add_argument("--no-autologin", action="store_true",
                     help="凭证失效时不自动调用验证码登录(青龙无浏览器依赖时用)")
-    ap.add_argument("--gemini-proxy", default=None,
-                    help="Gemini 专用代理地址 (默认: %s)" % DEFAULT_GEMINI_PROXY)
     args = ap.parse_args()
 
     if not os.path.exists(args.config):
@@ -529,10 +462,6 @@ def main():
     cfg = json.load(open(args.config, encoding="utf-8"))
     if cfg.get("proxy"):
         set_global_proxy(cfg["proxy"])
-    if args.gemini_proxy:
-        cfg["gemini_proxy"] = args.gemini_proxy
-    elif "gemini_proxy" not in cfg:
-        cfg["gemini_proxy"] = DEFAULT_GEMINI_PROXY
 
     if args.domain:
         domains = [d.strip().lower().rstrip(".") for d in args.domain]

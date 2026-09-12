@@ -51,6 +51,7 @@ PLAYWRIGHT_BROWSERS_PATH=$PWD/.venv/ms-playwright .venv/bin/playwright install c
   "freessl_password": "账号密码(仅captcha_solver用)",
   "gemini_api_keys": ["key1", "key2", "..."],   // 多key自动轮询
   "gemini_model": "gemini-3.5-flash",
+  "gemini_proxy": "http://Clash:pfabkvBh@192.168.31.99:7890", // 可选, 脚本已默认集成
   "productid": "trustasiafree01",                // 免费90天单域名
   "authmethod": "dns",
   "keytype": "rsa",
